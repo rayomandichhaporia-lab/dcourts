@@ -1,8 +1,9 @@
 """
-Standalone district-court scraper for the public eCourts case-status flow.
+Standalone district-court scraper for the public eCourts flow.
 
-This script keeps the district-court path isolated:
-casestatus/index -> fillDistrict -> fillcomplex -> captcha -> submit* -> parse results
+Supported entry flows:
+- casestatus/index -> fillDistrict -> fillcomplex -> captcha -> submit* -> parse results
+- courtorder/index -> fillDistrict -> fillcomplex -> captcha -> submitOrderDate -> parse results
 """
 
 import argparse
@@ -23,10 +24,19 @@ from bs4 import BeautifulSoup
 
 
 BASE_URL = "https://services.ecourts.gov.in/ecourtindia_v6/"
-ENTRY_URL = (
+CASESTATUS_ENTRY_URL = (
     BASE_URL
     + "?p=casestatus/index&app_token=8e3fded720c52b0d6257a5cdb8391934f44635bbf8f0b1e5c8ceb52735f66607"
 )
+COURTORDER_ENTRY_URL = (
+    BASE_URL
+    + "?p=courtorder/index&app_token=8e3fded720c52b0d6257a5cdb8391934f44635bbf8f0b1e5c8ceb52735f66607"
+)
+ENTRY_URL = CASESTATUS_ENTRY_URL
+ENTRY_URLS = {
+    "casestatus": CASESTATUS_ENTRY_URL,
+    "courtorder": COURTORDER_ENTRY_URL,
+}
 
 HEADERS = {
     "User-Agent": (
@@ -42,7 +52,6 @@ AJAX_HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     "X-Requested-With": "XMLHttpRequest",
     "Origin": "https://services.ecourts.gov.in",
-    "Referer": ENTRY_URL,
 }
 
 ENUM_RE = re.compile(r"(?<!\()(?<!\d)(\d{1,3})\)\s*")
@@ -59,10 +68,28 @@ class DistrictCaseStatusScraper:
         captcha_api_key: Optional[str] = None,
         proxy_file: Optional[str] = None,
         use_local_model: bool = False,
+        allow_2captcha: bool = True,
         onnx_model_path: Optional[str] = None,
         min_local_conf: float = 0.55,
         proxy_getter=None,
+        entry_mode: str = "casestatus",
+        verbose: bool = True,
+        ajax_transport_retries: int = 3,
+        ajax_retry_wait_first: float = 0.75,
+        ajax_retry_wait_second: float = 1.5,
     ) -> None:
+        normalized_entry_mode = (entry_mode or "casestatus").strip().lower()
+        if normalized_entry_mode not in ENTRY_URLS:
+            raise ValueError(
+                f"Unsupported entry_mode={entry_mode!r}; expected one of {sorted(ENTRY_URLS.keys())}"
+            )
+        self.entry_mode = normalized_entry_mode
+        self.entry_url = ENTRY_URLS[normalized_entry_mode]
+        self.verbose = bool(verbose)
+        self.ajax_transport_retries = max(1, int(ajax_transport_retries))
+        self.ajax_retry_wait_first = max(0.0, float(ajax_retry_wait_first))
+        self.ajax_retry_wait_second = max(0.0, float(ajax_retry_wait_second))
+
         self.captcha_api_key = (captcha_api_key or os.getenv("TWOCAPTCHA_API_KEY", "")).strip()
         self.session = requests.Session()
         self.session.trust_env = False
@@ -82,6 +109,7 @@ class DistrictCaseStatusScraper:
         self._proxy_getter = proxy_getter
 
         self.use_local_model = bool(use_local_model)
+        self.allow_2captcha = bool(allow_2captcha)
         self.min_local_conf = float(min_local_conf)
         self._ort_session = None
         self._ort_input_name = None
@@ -100,6 +128,10 @@ class DistrictCaseStatusScraper:
 
         if self.use_local_model:
             self._load_captcha_model(onnx_model_path)
+
+    def _log(self, message: str) -> None:
+        if self.verbose:
+            print(message)
 
     def _ensure_training_set(self) -> None:
         self.training_images_dir.mkdir(parents=True, exist_ok=True)
@@ -163,9 +195,9 @@ class DistrictCaseStatusScraper:
                     ip, port, user, password = parts
                     proxy_url = f"http://{user}:{password}@{ip}:{port}"
                     self._proxies.append({"http": proxy_url, "https": proxy_url})
-            print(f"[+] Loaded {len(self._proxies)} proxies for 2captcha")
+            self._log(f"[+] Loaded {len(self._proxies)} proxies for 2captcha")
         except Exception as exc:
-            print(f"[!] Failed to load proxies: {exc}")
+            self._log(f"[!] Failed to load proxies: {exc}")
 
     def _get_next_proxy(self) -> Optional[Dict[str, str]]:
         if not self._proxies:
@@ -205,7 +237,7 @@ class DistrictCaseStatusScraper:
             import onnxruntime as ort
             import yaml
         except Exception:
-            print("[!] Local CAPTCHA dependencies missing; using 2captcha if configured.")
+            self._log("[!] Local CAPTCHA dependencies missing; using 2captcha if configured.")
             self.use_local_model = False
             return
 
@@ -223,13 +255,13 @@ class DistrictCaseStatusScraper:
 
         selected = next((path for path in candidates if path.exists()), None)
         if selected is None:
-            print("[!] Local CAPTCHA model not found; using 2captcha if configured.")
+            self._log("[!] Local CAPTCHA model not found; using 2captcha if configured.")
             self.use_local_model = False
             return
 
         meta_path = selected.with_suffix(".yaml")
         if not meta_path.exists():
-            print(f"[!] CAPTCHA model metadata not found: {meta_path}")
+            self._log(f"[!] CAPTCHA model metadata not found: {meta_path}")
             self.use_local_model = False
             return
 
@@ -264,9 +296,9 @@ class DistrictCaseStatusScraper:
             )
             self._ort_input_name = self._ort_session.get_inputs()[0].name
             self._ort_output_name = self._ort_session.get_outputs()[0].name
-            print(f"[+] Loaded local CAPTCHA model: {selected}")
+            self._log(f"[+] Loaded local CAPTCHA model: {selected}")
         except Exception as exc:
-            print(f"[!] Failed to load local CAPTCHA model: {exc}")
+            self._log(f"[!] Failed to load local CAPTCHA model: {exc}")
             self.use_local_model = False
             self._ort_session = None
             self._captcha_meta = None
@@ -301,7 +333,7 @@ class DistrictCaseStatusScraper:
             confidence = float(np.mean(np.max(probs, axis=1)))
 
             if confidence < self.min_local_conf:
-                print(
+                self._log(
                     "[!] Local model prediction rejected: "
                     f"{solution} ({confidence:.3f} < {self.min_local_conf})"
                 )
@@ -309,15 +341,15 @@ class DistrictCaseStatusScraper:
 
             return solution, confidence
         except Exception as exc:
-            print(f"[!] Local model inference failed: {exc}")
+            self._log(f"[!] Local model inference failed: {exc}")
             return None
 
     def init_session(self) -> None:
         for attempt in range(4):
-            print("[*] Initializing case-status session...")
-            response = self.session.get(ENTRY_URL, timeout=30)
+            self._log(f"[*] Initializing {self.entry_mode} session...")
+            response = self.session.get(self.entry_url, timeout=30)
             if response.status_code == 405:
-                print(f"[!] 405 Security Page on init (attempt {attempt + 1}/4), rotating proxy...")
+                self._log(f"[!] 405 Security Page on init (attempt {attempt + 1}/4), rotating proxy...")
                 self._apply_next_proxy()
                 continue
             response.raise_for_status()
@@ -326,9 +358,9 @@ class DistrictCaseStatusScraper:
             token_input = soup.find("input", {"id": "app_token"})
             if token_input:
                 self.app_token = token_input.get("value", "")
-                print(f"[+] Got app_token: {self.app_token[:20]}...")
+                self._log(f"[+] Got app_token: {self.app_token[:20]}...")
 
-            print(f"[+] Session ID: {self.session.cookies.get('SERVICES_SESSID', 'N/A')}")
+            self._log(f"[+] Session ID: {self.session.cookies.get('SERVICES_SESSID', 'N/A')}")
             self.initialized = True
             return
         raise RuntimeError("Session init failed: 405 Security Page after 4 proxy rotations")
@@ -342,13 +374,18 @@ class DistrictCaseStatusScraper:
         headers = dict(AJAX_HEADERS)
         if referer:
             headers["Referer"] = referer
+        else:
+            headers["Referer"] = self.entry_url
 
         last_exc = None
-        for attempt in range(3):
+        for attempt in range(self.ajax_transport_retries):
             try:
                 response = self.session.post(url, data=data, headers=headers, timeout=30)
                 if response.status_code == 405:
-                    print(f"[!] 405 Security Page on {endpoint} (attempt {attempt + 1}/3), rotating proxy...")
+                    self._log(
+                        f"[!] 405 Security Page on {endpoint} "
+                        f"(attempt {attempt + 1}/{self.ajax_transport_retries}), rotating proxy..."
+                    )
                     prev_state = self._session_state
                     prev_dist = self._session_district
                     self._rotate_proxy_and_reinit()
@@ -358,10 +395,10 @@ class DistrictCaseStatusScraper:
                 break
             except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as exc:
                 last_exc = exc
-                if attempt < 2:
+                if attempt + 1 < self.ajax_transport_retries:
                     # Keep retries fast; rotate only after repeated transport failures.
-                    wait_sec = 0.75 if attempt == 0 else 1.5
-                    print(f"[!] Transport error on {endpoint}, retrying in {wait_sec:.2f}s...")
+                    wait_sec = self.ajax_retry_wait_first if attempt == 0 else self.ajax_retry_wait_second
+                    self._log(f"[!] Transport error on {endpoint}, retrying in {wait_sec:.2f}s...")
                     if attempt >= 1:
                         prev_state = self._session_state
                         prev_dist = self._session_district
@@ -370,7 +407,7 @@ class DistrictCaseStatusScraper:
                             if prev_state:
                                 self._ensure_session_state(prev_state, prev_dist or "")
                         except Exception as rotate_exc:
-                            print(f"[!] Transport retry proxy-rotate failed: {rotate_exc}")
+                            self._log(f"[!] Transport retry proxy-rotate failed: {rotate_exc}")
                     time.sleep(wait_sec)
                 else:
                     raise
@@ -397,13 +434,13 @@ class DistrictCaseStatusScraper:
 
     def _ensure_session_state(self, state_code: str, dist_code: str) -> None:
         if self._session_state != state_code:
-            print(f"[*] Setting session state={state_code}...")
+            self._log(f"[*] Setting session state={state_code}...")
             self._ajax_post("casestatus/fillDistrict", f"state_code={state_code}")
             self._session_state = state_code
             self._session_district = None
 
         if self._session_district != dist_code:
-            print(f"[*] Setting session district={dist_code}...")
+            self._log(f"[*] Setting session district={dist_code}...")
             self._ajax_post(
                 "casestatus/fillcomplex",
                 f"state_code={state_code}&dist_code={dist_code}",
@@ -419,7 +456,7 @@ class DistrictCaseStatusScraper:
 
         for attempt in range(1, max_retries + 1):
             try:
-                response = self.session.get(captcha_url, headers={"Referer": ENTRY_URL}, timeout=30)
+                response = self.session.get(captcha_url, headers={"Referer": self.entry_url}, timeout=30)
             except (
                 requests.exceptions.ProxyError,
                 requests.exceptions.ConnectionError,
@@ -429,14 +466,14 @@ class DistrictCaseStatusScraper:
             ) as exc:
                 last_error = exc
                 if attempt < max_retries:
-                    print(
+                    self._log(
                         f"[!] CAPTCHA image transport error (attempt {attempt}/{max_retries}), "
                         "rotating proxy and retrying..."
                     )
                     try:
                         self._rotate_proxy_and_reinit()
                     except Exception as rotate_exc:
-                        print(f"[!] CAPTCHA image rotate/reinit failed: {rotate_exc}")
+                        self._log(f"[!] CAPTCHA image rotate/reinit failed: {rotate_exc}")
                     time.sleep(min(0.5 * attempt, 2.0))
                     continue
                 raise
@@ -444,14 +481,14 @@ class DistrictCaseStatusScraper:
             if response.status_code == 405:
                 last_error = RuntimeError("405 Security Page while fetching CAPTCHA image")
                 if attempt < max_retries:
-                    print(
+                    self._log(
                         f"[!] 405 Security Page on CAPTCHA image (attempt {attempt}/{max_retries}), "
                         "rotating proxy and retrying..."
                     )
                     try:
                         self._rotate_proxy_and_reinit()
                     except Exception as rotate_exc:
-                        print(f"[!] CAPTCHA image rotate/reinit failed: {rotate_exc}")
+                        self._log(f"[!] CAPTCHA image rotate/reinit failed: {rotate_exc}")
                     time.sleep(min(0.5 * attempt, 2.0))
                     continue
                 response.raise_for_status()
@@ -461,14 +498,14 @@ class DistrictCaseStatusScraper:
             except requests.RequestException as exc:
                 last_error = exc
                 if attempt < max_retries and response.status_code >= 500:
-                    print(
+                    self._log(
                         f"[!] CAPTCHA image HTTP {response.status_code} "
                         f"(attempt {attempt}/{max_retries}), rotating proxy and retrying..."
                     )
                     try:
                         self._rotate_proxy_and_reinit()
                     except Exception as rotate_exc:
-                        print(f"[!] CAPTCHA image rotate/reinit failed: {rotate_exc}")
+                        self._log(f"[!] CAPTCHA image rotate/reinit failed: {rotate_exc}")
                     time.sleep(min(0.5 * attempt, 2.0))
                     continue
                 raise
@@ -476,14 +513,14 @@ class DistrictCaseStatusScraper:
             if not response.content:
                 last_error = RuntimeError("Empty CAPTCHA image response")
                 if attempt < max_retries:
-                    print(
+                    self._log(
                         f"[!] Empty CAPTCHA image response (attempt {attempt}/{max_retries}), "
                         "rotating proxy and retrying..."
                     )
                     try:
                         self._rotate_proxy_and_reinit()
                     except Exception as rotate_exc:
-                        print(f"[!] CAPTCHA image rotate/reinit failed: {rotate_exc}")
+                        self._log(f"[!] CAPTCHA image rotate/reinit failed: {rotate_exc}")
                     time.sleep(min(0.5 * attempt, 2.0))
                     continue
                 break
@@ -497,21 +534,21 @@ class DistrictCaseStatusScraper:
             try:
                 image_data = self.get_captcha_image()
             except Exception as exc:
-                print(f"[-] CAPTCHA image fetch failed on attempt {attempt + 1}: {exc}")
+                self._log(f"[-] CAPTCHA image fetch failed on attempt {attempt + 1}: {exc}")
                 if attempt + 1 < max_retries:
                     continue
                 raise
 
             if self.use_local_model:
-                print(f"[*] Solving CAPTCHA locally ({attempt + 1}/{max_retries})...")
+                self._log(f"[*] Solving CAPTCHA locally ({attempt + 1}/{max_retries})...")
                 result = self._solve_captcha_local(image_data)
                 if result:
                     solution, confidence = result
-                    print(f"[+] Local CAPTCHA solution: {solution} ({confidence:.3f})")
+                    self._log(f"[+] Local CAPTCHA solution: {solution} ({confidence:.3f})")
                     return solution
                 if not allow_2captcha:
                     continue
-                print("[!] Local CAPTCHA solve failed, falling back to 2captcha.")
+                self._log("[!] Local CAPTCHA solve failed, falling back to 2captcha.")
 
             if not allow_2captcha:
                 continue
@@ -636,14 +673,18 @@ class DistrictCaseStatusScraper:
         result = {}
         for attempt in range(retries):
             try:
-                captcha_code = self.solve_captcha()
+                captcha_retries = 1 if not self.allow_2captcha else 3
+                captcha_code = self.solve_captcha(
+                    max_retries=captcha_retries,
+                    allow_2captcha=self.allow_2captcha,
+                )
             except Exception as exc:
-                print(f"[!] CAPTCHA solve failed on attempt {attempt + 1}/{retries}: {exc}")
+                self._log(f"[!] CAPTCHA solve failed on attempt {attempt + 1}/{retries}: {exc}")
                 if attempt + 1 < retries:
                     try:
                         self._rotate_proxy_and_reinit()
                     except Exception as rotate_exc:
-                        print(f"[!] CAPTCHA solve rotate/reinit failed: {rotate_exc}")
+                        self._log(f"[!] CAPTCHA solve rotate/reinit failed: {rotate_exc}")
                     continue
                 raise
 
@@ -653,29 +694,58 @@ class DistrictCaseStatusScraper:
                     f"{post_data_without_captcha}&{captcha_field}={captcha_code}",
                 )
             except Exception as exc:
-                print(f"[!] Search submit failed on attempt {attempt + 1}/{retries}: {exc}")
+                self._log(f"[!] Search submit failed on attempt {attempt + 1}/{retries}: {exc}")
                 if attempt + 1 < retries:
                     try:
                         self._rotate_proxy_and_reinit()
                     except Exception as rotate_exc:
-                        print(f"[!] Search submit rotate/reinit failed: {rotate_exc}")
+                        self._log(f"[!] Search submit rotate/reinit failed: {rotate_exc}")
                     continue
                 raise
 
             if not self._is_captcha_error(result):
                 return result
-            print(f"[!] CAPTCHA rejected on attempt {attempt + 1}, retrying...")
+            self._log(f"[!] CAPTCHA rejected on attempt {attempt + 1}, retrying...")
             if attempt + 1 < retries:
                 try:
                     self._rotate_proxy_and_reinit()
                 except Exception as rotate_exc:
-                    print(f"[!] CAPTCHA reject rotate/reinit failed: {rotate_exc}")
+                    self._log(f"[!] CAPTCHA reject rotate/reinit failed: {rotate_exc}")
         return result
+
+    def _submit_search_with_optional_empty_captcha(
+        self,
+        endpoint: str,
+        post_data_without_captcha: str,
+        captcha_field: str,
+        retries: int = 3,
+    ) -> dict:
+        """
+        Fast path for endpoints that may not enforce CAPTCHA when the field is empty.
+        If server rejects empty CAPTCHA, automatically fall back to normal CAPTCHA flow.
+        """
+        try:
+            result = self._ajax_post(
+                endpoint,
+                f"{post_data_without_captcha}&{captcha_field}=",
+            )
+            if not self._is_captcha_error(result):
+                return result
+            self._log("[*] Empty CAPTCHA rejected, falling back to solved CAPTCHA flow...")
+        except Exception as exc:
+            self._log(f"[!] Empty CAPTCHA attempt failed: {exc}; falling back to solved CAPTCHA flow...")
+
+        return self._submit_search_with_captcha(
+            endpoint,
+            post_data_without_captcha,
+            captcha_field,
+            retries=retries,
+        )
 
     def list_states(self) -> Dict[str, str]:
         if not self.initialized:
             self.init_session()
-        response = self.session.get(ENTRY_URL, timeout=30)
+        response = self.session.get(self.entry_url, timeout=30)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
         select = soup.find("select", {"id": "sess_state_code"})
@@ -712,9 +782,48 @@ class DistrictCaseStatusScraper:
                     courts[value] = option.get_text(strip=True)
         return courts
 
+    def list_case_types(
+        self,
+        state_code: str,
+        dist_code: str,
+        court_complex_code: str,
+        search_type: str = "c_no",
+    ) -> Dict[str, str]:
+        complex_code, _, differ_flag = self._extract_complex_parts(court_complex_code)
+        est_code = ""
+        if differ_flag == "Y":
+            est_code = ""
+        self._ensure_session_state(state_code, dist_code)
+        result = self._ajax_post(
+            "casestatus/fillCaseType",
+            (
+                f"state_code={state_code}"
+                f"&dist_code={dist_code}"
+                f"&court_complex_code={complex_code}"
+                f"&est_code={est_code}"
+                f"&search_type={search_type}"
+            ),
+        )
+        case_types: Dict[str, str] = {}
+        if result.get("status") == 1 and result.get("casetype_list"):
+            soup = BeautifulSoup(result["casetype_list"], "html.parser")
+            for option in soup.find_all("option"):
+                value = option.get("value", "")
+                if value and value != "0":
+                    case_types[value] = option.get_text(strip=True)
+        return case_types
+
     @staticmethod
     def _extract_complex_code(court_complex_code: str) -> str:
         return court_complex_code.split("@", 1)[0] if "@" in court_complex_code else court_complex_code
+
+    @staticmethod
+    def _extract_complex_parts(court_complex_code: str) -> Tuple[str, str, str]:
+        parts = (court_complex_code or "").split("@")
+        complex_code = parts[0] if parts else ""
+        court_complex_arr = parts[1] if len(parts) > 1 else ""
+        differ_flag = parts[2] if len(parts) > 2 else ""
+        return complex_code, court_complex_arr, differ_flag
 
     def search_by_party_name(
         self,
@@ -752,23 +861,26 @@ class DistrictCaseStatusScraper:
         state_code: str,
         dist_code: str,
         court_complex_code: str,
+        retries: int = 3,
     ) -> dict:
         complex_code = self._extract_complex_code(court_complex_code)
         self._ensure_session_state(state_code, dist_code)
         post_data = (
             f"case_type={case_type}"
             f"&search_case_no={case_no}"
+            f"&case_no={case_no}"
             f"&rgyear={year}"
             f"&state_code={state_code}"
             f"&dist_code={dist_code}"
             f"&court_complex_code={complex_code}"
             f"&est_code="
         )
-        print(f"[*] Searching case number: {case_type}/{case_no}/{year}")
-        result = self._submit_search_with_captcha(
+        self._log(f"[*] Searching case number: {case_type}/{case_no}/{year}")
+        result = self._submit_search_with_optional_empty_captcha(
             "casestatus/submitCaseNo",
             post_data,
             "case_captcha_code",
+            retries=retries,
         )
         return self._process_search_result(result)
 
@@ -853,9 +965,97 @@ class DistrictCaseStatusScraper:
         )
         return self._process_search_result(result)
 
+    def search_by_order_date(
+        self,
+        from_date: str,
+        to_date: str,
+        state_code: str,
+        dist_code: str,
+        court_complex_code: str,
+        order_type: str = "both",
+        retries: int = 3,
+    ) -> dict:
+        normalized_order_type = (order_type or "both").strip().lower()
+        if normalized_order_type not in {"interim", "final", "both"}:
+            raise ValueError(
+                f"Unsupported order_type={order_type!r}; expected one of interim/final/both"
+            )
+
+        complex_code, court_complex_arr, differ_flag = self._extract_complex_parts(court_complex_code)
+        est_code = ""
+        if differ_flag == "Y":
+            est_code = court_complex_arr
+
+        self._ensure_session_state(state_code, dist_code)
+        post_data = (
+            f"from_date={requests.utils.quote(from_date, safe='')}"
+            f"&to_date={requests.utils.quote(to_date, safe='')}"
+            f"&fradorderdt={normalized_order_type}"
+            f"&state_code={state_code}"
+            f"&dist_code={dist_code}"
+            f"&court_complex={complex_code}"
+            f"&court_complex_arr={court_complex_arr}"
+            f"&est_code={est_code}"
+            f"&orderflagvalorderdt={normalized_order_type}"
+        )
+        print(
+            "[*] Searching court orders by date: "
+            f"{from_date} -> {to_date} | order_type={normalized_order_type}"
+        )
+        result = self._submit_search_with_captcha(
+            "courtorder/submitOrderDate",
+            post_data,
+            "order_date_captcha_code",
+            retries=retries,
+        )
+        return self._process_search_result(result)
+
+    def search_courtorder_by_case_number(
+        self,
+        case_type: str,
+        case_no: str,
+        year: str,
+        state_code: str,
+        dist_code: str,
+        court_complex_code: str,
+        order_type: str = "both",
+        retries: int = 3,
+    ) -> dict:
+        normalized_order_type = (order_type or "both").strip().lower()
+        if normalized_order_type not in {"interim", "final", "both"}:
+            raise ValueError(
+                f"Unsupported order_type={order_type!r}; expected one of interim/final/both"
+            )
+        complex_code, court_complex_arr, differ_flag = self._extract_complex_parts(court_complex_code)
+        est_code = ""
+        if differ_flag == "Y":
+            est_code = court_complex_arr
+
+        self._ensure_session_state(state_code, dist_code)
+        post_data = (
+            f"frad={normalized_order_type}"
+            f"&state_code={state_code}"
+            f"&dist_code={dist_code}"
+            f"&court_complex={complex_code}"
+            f"&court_complex_arr={court_complex_arr}"
+            f"&est_code={est_code}"
+            f"&case_type={requests.utils.quote(case_type, safe='')}"
+            f"&case_no={requests.utils.quote(case_no, safe='')}"
+            f"&rgyear={requests.utils.quote(year, safe='')}"
+            f"&radvalue={normalized_order_type}"
+        )
+        print(f"[*] Searching court orders by case number: {case_type}/{case_no}/{year}")
+        result = self._submit_search_with_optional_empty_captcha(
+            "courtorder/submitCaseNo",
+            post_data,
+            "order_case_captcha_code",
+            retries=retries,
+        )
+        return self._process_search_result(result)
+
     def _process_search_result(self, result: dict) -> dict:
         if result.get("errormsg"):
-            print(f"[-] Server error: {result['errormsg']}")
+            self._log(f"[-] Server error: {result['errormsg']}")
             return result
 
         html_key, html = self._extract_results_html(result)
@@ -864,13 +1064,15 @@ class DistrictCaseStatusScraper:
             result["case_headers"] = headers
             result["cases"] = cases
             result["results_html_key"] = html_key
-            print(f"[+] Found {len(cases)} case(s)")
+            self._log(f"[+] Found {len(cases)} case(s)")
 
         return result
 
     def _extract_results_html(self, result: dict) -> Tuple[Optional[str], str]:
         preferred_keys = [
             "historytable",
+            "court_dt_data",
+            "court_no_data",
             "party_data",
             "case_data",
             "filing_data",
@@ -906,7 +1108,7 @@ class DistrictCaseStatusScraper:
             if not td_cells:
                 continue
 
-            record: Dict[str, object] = {"cells": []}
+            record: Dict[str, object] = {"cells": [], "row_html": str(row)}
             for idx, cell in enumerate(td_cells):
                 text = cell.get_text(" ", strip=True)
                 link = cell.find("a")
@@ -957,8 +1159,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--type",
-        choices=["party", "case", "filing", "advocate", "fir"],
+        choices=["party", "case", "filing", "advocate", "fir", "orderdate"],
         help="Search type",
+    )
+    parser.add_argument(
+        "--entry-mode",
+        choices=["casestatus", "courtorder"],
+        default="casestatus",
+        help="Which entry page to initialize before API calls",
     )
     parser.add_argument("--state", type=str, help="State code")
     parser.add_argument("--district", type=str, help="District code")
@@ -977,9 +1185,29 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--advocate", type=str, help="Advocate name")
     parser.add_argument("--police-station", type=str, help="Police station code")
     parser.add_argument("--fir-no", type=str, help="FIR number")
+    parser.add_argument("--from-date", type=str, help="From date (dd-mm-yyyy) for order-date search")
+    parser.add_argument("--to-date", type=str, help="To date (dd-mm-yyyy) for order-date search")
+    parser.add_argument(
+        "--order-type",
+        choices=["interim", "final", "both"],
+        default="both",
+        help="Order type for order-date search",
+    )
 
     parser.add_argument("--captcha-api-key", type=str, help="Override TWOCAPTCHA_API_KEY")
     parser.add_argument("--proxy-file", type=str, help="Proxy list for 2captcha")
+    parser.add_argument(
+        "--allow-2captcha",
+        dest="allow_2captcha",
+        action="store_true",
+        help="Allow fallback to 2captcha when local CAPTCHA solve fails",
+    )
+    parser.add_argument(
+        "--no-2captcha",
+        dest="allow_2captcha",
+        action="store_false",
+        help="Disable 2captcha fallback and retry with new session on local solve failure",
+    )
     parser.add_argument(
         "--use-local-model",
         action="store_true",
@@ -993,6 +1221,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--onnx-model-path", type=str, help="Path to a local CAPTCHA ONNX model")
     parser.add_argument("--min-local-conf", type=float, default=0.55)
     parser.add_argument("--output", "-o", type=str, help="Write full JSON result to a file")
+    parser.set_defaults(allow_2captcha=True)
     return parser
 
 
@@ -1014,8 +1243,10 @@ def main() -> None:
         captcha_api_key=args.captcha_api_key,
         proxy_file=args.proxy_file,
         use_local_model=use_local_model,
+        allow_2captcha=bool(args.allow_2captcha),
         onnx_model_path=args.onnx_model_path,
         min_local_conf=args.min_local_conf,
+        entry_mode=args.entry_mode,
     )
     scraper.init_session()
 
@@ -1088,6 +1319,19 @@ def main() -> None:
             args.district,
             args.court_complex,
             case_status=args.status,
+        )
+    elif args.type == "orderdate":
+        if not all([args.from_date, args.to_date, args.state, args.district, args.court_complex]):
+            parser.error(
+                "--from-date, --to-date, --state, --district, and --court-complex are required for orderdate search"
+            )
+        result = scraper.search_by_order_date(
+            from_date=args.from_date,
+            to_date=args.to_date,
+            state_code=args.state,
+            dist_code=args.district,
+            court_complex_code=args.court_complex,
+            order_type=args.order_type,
         )
     else:
         if not all(
